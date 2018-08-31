@@ -33,6 +33,7 @@ type App struct {
 	Host    string
 	Port    int
 	Command *exec.Cmd
+	WpdsCommand *exec.Cmd
 	Public  bool
 	Events  *Events
 
@@ -41,6 +42,7 @@ type App struct {
 
 	address string
 	dir     string
+	socket  string
 
 	t tomb.Tomb
 
@@ -258,26 +260,29 @@ fi
 exec puma -C $CONFIG --tag puma-dev:%s -w $WORKERS -t 0:$THREADS -b unix:%s'
 `
 
-func (pool *AppPool) LaunchApp(name, dir string) (*App, error) {
-	tmpDir := filepath.Join(dir, "tmp")
-	err := os.MkdirAll(tmpDir, 0755)
-	if err != nil {
-		return nil, err
-	}
-
-	socket := filepath.Join(tmpDir, fmt.Sprintf("puma-dev-%d.sock", os.Getpid()))
-
+func shell() string {
 	shell := os.Getenv("SHELL")
 
 	if shell == "" {
 		fmt.Printf("! SHELL env var not set, using /bin/bash by default")
 		shell = "/bin/bash"
 	}
+	return shell
+}
 
-	cmd := exec.Command(shell, "-l", "-i", "-c",
-		fmt.Sprintf(executionShell, dir, name, socket, name, socket))
+func (a *App) Launch() error {
+	tmpDir := filepath.Join(a.dir, "tmp")
+	err := os.MkdirAll(tmpDir, 0755)
+	if err != nil {
+		return err
+	}
 
-	cmd.Dir = dir
+	socket := filepath.Join(tmpDir, fmt.Sprintf("puma-dev-%d.sock", os.Getpid()))
+
+	cmd := exec.Command(shell(), "-l", "-i", "-c",
+		fmt.Sprintf(executionShell, a.dir, a.Name, socket, a.Name, socket))
+
+	cmd.Dir = a.dir
 
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env,
@@ -288,37 +293,84 @@ func (pool *AppPool) LaunchApp(name, dir string) (*App, error) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	cmd.Stderr = cmd.Stdout
 
 	err = cmd.Start()
 	if err != nil {
-		return nil, errors.Context(err, "starting app")
+		return errors.Context(err, "starting app")
 	}
 
-	fmt.Printf("! Booting app '%s' on socket %s\n", name, socket)
+	fmt.Printf("! Booting app '%s' on socket %s\n", a.Name, socket)
 
+	a.Command = cmd
+	a.stdout = stdout
+	a.lastUse = time.Now()
+	a.socket = socket
+
+	return nil
+}
+
+const executionShellWpds = `exec bash -c '
+cd %s
+
+if test -e ~/.powconfig; then
+	source ~/.powconfig
+fi
+
+if test -e .env; then
+	source .env
+fi
+
+docker-compose up -d'
+`
+
+func (a *App) LaunchWpds() error {
+	cmd := exec.Command(shell(), "-l", "-i", "-c",
+		fmt.Sprintf(executionShellWpds, a.dir))
+
+	cmd.Dir = a.dir
+
+	cmd.Env = os.Environ()
+
+	err := cmd.Start()
+	if err != nil {
+		return errors.Context(err, "starting app")
+	}
+
+	fmt.Printf("! Booting docker-compose\n")
+
+	return nil
+}
+
+func (pool *AppPool) LaunchApp(name, dir string) (*App, error) {
 	app := &App{
 		Name:      name,
-		Command:   cmd,
-		Events:    pool.Events,
-		stdout:    stdout,
 		dir:       dir,
 		pool:      pool,
+		Events:    pool.Events,
 		readyChan: make(chan struct{}),
-		lastUse:   time.Now(),
+	}
+	err := app.Launch()
+	if err != nil {
+		return nil, err
 	}
 
-	app.eventAdd("booting_app", "socket", socket)
+	err = app.LaunchWpds()
+	if err != nil {
+		return nil, err
+	}
+
+	app.eventAdd("booting_app", "socket", app.socket)
 
 	stat, err := os.Stat(filepath.Join(dir, "public"))
 	if err == nil {
 		app.Public = stat.IsDir()
 	}
 
-	app.SetAddress("httpu", socket, 0)
+	app.SetAddress("httpu", app.socket, 0)
 
 	app.t.Go(app.watch)
 	app.t.Go(app.idleMonitor)
@@ -339,7 +391,7 @@ func (pool *AppPool) LaunchApp(name, dir string) (*App, error) {
 				fmt.Printf("! Detecting app '%s' dying on start\n", name)
 				return fmt.Errorf("app died before booting")
 			case <-ticker.C:
-				c, err := net.Dial("unix", socket)
+				c, err := net.Dial("unix", app.socket)
 				if err == nil {
 					c.Close()
 					app.eventAdd("app_ready")
